@@ -203,121 +203,97 @@ Client          Server          Database
 
 ## 4. Application-Layer Protocol Design
 
-### 4.1 Protocol Specifications
+### 4.1 Protocol Overview
 
-**Protocol Name:** FTP-Custom  
-**Transport:** TCP Sockets  
-**Port:** 8080 (configurable)  
-**Encoding:** Binary header + JSON/Binary payload
+This application implements a **simple TCP-based file transfer protocol** for transferring text files between client and server. The protocol operates on **port 8080** and uses raw TCP socket communication without additional protocol headers or authentication mechanisms.
 
-### 4.2 Message Format
+### 4.2 Protocol Architecture
+
+**Transport Layer:** TCP (Transmission Control Protocol)
+**Port:** 8080
+**IP Address:** 127.0.0.1 (localhost)
+**Connection Model:** One-to-one (single client per server instance)
+
+### 4.3 Message Format
+
+The protocol uses a **raw data stream** approach with no custom headers:
 
 ```
-┌─────────────────┬──────┬─────────────────────────┐
-│ Field           │ Size │ Description             │
-├─────────────────┼──────┼─────────────────────────┤
-│ Magic Number    │ 4B   │ 0x46545053 ("FTPS")     │
-│ Version         │ 1B   │ Protocol version (0x01) │
-│ Command Code    │ 2B   │ Operation type          │
-│ Sequence Number │ 4B   │ Message sequence ID     │
-│ Payload Length  │ 4B   │ Length of payload       │
-│ Checksum        │ 4B   │ CRC32 for integrity     │
-│ Payload         │ Var  │ JSON metadata or binary │
-└─────────────────┴──────┴─────────────────────────┘
-Total Header: 19 bytes
++------------------+
+|   File Data      |
+|   (Raw bytes)    |
++------------------+
 ```
 
-### 4.3 Command Codes
+- **No Protocol Header:** Data is sent directly without metadata
+- **Buffer Size:** 1024 bytes per transmission chunk
+- **Data Format:** Text data read line-by-line using `fgets()`
 
-| Code   | Command           | Description                    |
-|--------|-------------------|--------------------------------|
-| 0x0001 | AUTH_REQUEST      | User authentication            |
-| 0x0002 | AUTH_RESPONSE     | Authentication result + token  |
-| 0x0003 | REGISTER_REQUEST  | New user registration          |
-| 0x0010 | LIST_DIR          | List directory contents        |
-| 0x0011 | CHANGE_DIR        | Change current directory       |
-| 0x0012 | MAKE_DIR          | Create new directory           |
-| 0x0020 | UPLOAD_INIT       | Initialize file upload         |
-| 0x0021 | UPLOAD_CHUNK      | Upload file chunk              |
-| 0x0022 | UPLOAD_COMPLETE   | Finalize upload                |
-| 0x0030 | DOWNLOAD_REQUEST  | Request file download          |
-| 0x0031 | DOWNLOAD_CHUNK    | Stream file chunk              |
-| 0x0040 | SEARCH_REQUEST    | Search files by name           |
-| 0x0041 | SEARCH_RESPONSE   | Search results                 |
-| 0x0050 | FILE_DELETE       | Delete file                    |
-| 0x0051 | FILE_RENAME       | Rename file                    |
-| 0x0052 | FILE_MOVE         | Move file                      |
-| 0x0053 | FILE_COPY         | Copy file                      |
-| 0x0060 | SET_PERMISSION    | Modify permissions             |
-| 0x0061 | GET_PERMISSION    | Query permissions              |
-| 0x0070 | GET_LOGS          | Retrieve activity logs         |
-| 0x00FF | ERROR             | Error response                 |
+### 4.4 Communication Flow
 
-### 4.4 Response Codes
+#### **Client-Side Operation:**
+1. Establish TCP connection to server (127.0.0.1:8080)
+2. Open source file (`send.txt`) for reading
+3. Read file data in 1024-byte chunks using `fgets()`
+4. Send each chunk via `send()` system call
+5. Close connection after complete file transmission
 
-| Code | Status               | Description                 |
-|------|----------------------|-----------------------------|
-| 200  | OK                   | Success                     |
-| 201  | CREATED              | Resource created            |
-| 400  | BAD_REQUEST          | Invalid request format      |
-| 401  | UNAUTHORIZED         | Authentication failed       |
-| 403  | FORBIDDEN            | Insufficient permissions    |
-| 404  | NOT_FOUND            | File/directory not found    |
-| 413  | PAYLOAD_TOO_LARGE    | File exceeds limit          |
-| 500  | INTERNAL_ERROR       | Server error                |
-| 507  | INSUFFICIENT_STORAGE | Server storage full         |
+#### **Server-Side Operation:**
+1. Bind to port 8080 and listen for incoming connections
+2. Accept single client connection
+3. Receive data chunks using `recv()` with 1024-byte buffer
+4. Write received data to destination file (`recv.txt`)
+5. Continue until connection closes (recv returns ≤ 0)
 
-### 4.5 Example Protocol Messages
+### 4.5 Data Transfer Mechanism
 
-**Authentication Request:**
-```json
-{
-  "command": "AUTH_REQUEST",
-  "payload": {
-    "username": "user123",
-    "password_hash": "bcrypt_hash_here"
-  }
-}
-```
+**Transmission Method:** Sequential streaming
+- Client reads file line-by-line
+- Each read operation transfers up to SIZE (1024) bytes
+- Buffer is cleared with `bzero()` between transmissions
+- Server writes data immediately to output file
 
-**Authentication Response:**
-```json
-{
-  "command": "AUTH_RESPONSE",
-  "status": 200,
-  "payload": {
-    "token": "jwt_token_here",
-    "user_id": 12345,
-    "expires_at": 1698765432
-  }
-}
-```
+**End-of-Transfer Detection:**
+- Connection closure signals end of file transfer
+- Server detects when `recv()` returns ≤ 0 bytes
 
-**Upload Init:**
-```json
-{
-  "command": "UPLOAD_INIT",
-  "token": "jwt_token",
-  "payload": {
-    "filename": "document.pdf",
-    "filesize": 2048576,
-    "destination": "/home/user/documents/"
-  }
-}
-```
+### 4.6 Error Handling
 
-**Upload Chunk:**
-```
-Header (19 bytes) + Binary data (64KB)
-```
+**Client-Side Errors:**
+- Socket creation failure
+- Connection refused
+- File not found (`send.txt`)
 
-### 4.6 Security Features
+**Server-Side Errors:**
+- Socket creation failure
+- Bind failure (port already in use)
+- Listen failure
+- File write errors
 
-1. **Password Security:** bcrypt hashing with salt
-2. **Session Management:** JWT tokens (24-hour expiration)
-3. **Data Integrity:** CRC32 checksums on all transfers
-4. **Rate Limiting:** Max 100 requests/minute per client
-5. **Connection Timeout:** 5 minutes idle timeout
+All errors trigger program termination via `exit(1)`.
+
+### 4.7 Protocol Limitations
+
+- **No Authentication:** No user verification or access control
+- **No Encryption:** Data transmitted in plaintext
+- **No Integrity Checking:** No checksums or hash verification
+- **No File Metadata:** Filename, size, and permissions not transmitted
+- **Single File Transfer:** Server handles one file per execution
+- **No Resume Capability:** Interrupted transfers cannot be resumed
+- **Fixed Filenames:** Hardcoded `send.txt` and `recv.txt`
+- **Text-Only Optimization:** Uses `fgets()` which is text-oriented
+
+### 4.8 Technical Specifications
+
+| Parameter | Value |
+|-----------|-------|
+| Protocol Type | Raw TCP Stream |
+| Port | 8080 |
+| Buffer Size | 1024 bytes |
+| Max Connections | 10 (listen backlog) |
+| File I/O Mode | Text mode (line-based) |
+| Socket Type | SOCK_STREAM (TCP) |
+| Address Family | AF_INET (IPv4) |
 
 ---
 
