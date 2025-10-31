@@ -24,77 +24,846 @@
 
 ---
 
-## 2. Operational Flow
+# Operational Flow: Next.js + Firebase OAuth + C File Transfer
 
-### 2.1 System Overview
-The system operates as a client-server architecture where:
-- **Server Side:** C-based server handles all file operations, socket communications, and business logic
-- **Client Side:** Next.js/React frontend provides user-friendly interface
-- **Communication:** WebSocket/TCP socket connections for real-time bidirectional communication
-
-### 2.2 User Authentication Flow
+## System Architecture Overview
 
 ```
-User → Web Interface (Login/Register)
+┌─────────────────────────────────────────────────────────────────┐
+│                         User Browser                             │
+│                     (Next.js Frontend)                           │
+└──────────────┬──────────────────────────────────────────────────┘
+               │
+               │ HTTPS
+               │
+┌──────────────▼──────────────────────────────────────────────────┐
+│                    Next.js Backend                               │
+│                  (API Routes + SSR)                              │
+└──────┬───────────────────────────────┬──────────────────────────┘
+       │                               │
+       │ Firebase Admin SDK            │ Child Process / IPC
+       │                               │
+┌──────▼───────────────┐      ┌────────▼──────────────────────────┐
+│  Firebase Services   │      │   C File Transfer Process         │
+│  - Authentication    │      │   - TCP Client/Server             │
+│  - Firestore DB      │      │   - File Operations               │
+│  - Storage (optional)│      │                                   │
+└──────────────────────┘      └───────────────────────────────────┘
+```
+
+## Technology Stack
+
+### Frontend Layer
+- **Framework:** Next.js 14+ (App Router)
+- **UI Components:** React components
+- **Styling:** Tailwind CSS / Material-UI
+- **File Upload:** HTML5 File API, drag-and-drop
+
+### Authentication Layer
+- **Provider:** Google OAuth 2.0
+- **Platform:** Firebase Authentication
+- **Session Management:** NextAuth.js or Firebase Auth SDK
+
+### Backend Layer
+- **API:** Next.js API Routes (App Router)
+- **Runtime:** Node.js
+- **C Integration:** Child process execution or native addons
+
+### Database Layer
+- **Service:** Firebase Firestore
+- **Data Storage:**
+  - User profiles
+  - File transfer history
+  - Transfer metadata
+  - Connection logs
+
+### File Transfer Layer
+- **Protocol:** TCP (existing C code)
+- **Execution:** Spawned C processes
+- **Communication:** stdio/IPC between Node.js and C
+
+## Detailed Operational Flow
+
+### Phase 1: User Authentication
+
+#### Step 1.1: Initial Access
+```
+User → Next.js App
+  1. User visits application URL
+  2. Next.js checks for existing session (cookies/JWT)
+  3. If no session: redirect to login page
+  4. If session exists: validate with Firebase
+```
+
+#### Step 1.2: Google OAuth Login
+```
+User → Google OAuth → Firebase Auth → Next.js
+  1. User clicks "Sign in with Google"
+  2. Next.js redirects to Google OAuth consent screen
+  3. User authorizes application
+  4. Google returns authorization code
+  5. Firebase Auth exchanges code for tokens
+  6. Firebase creates/updates user record
+  7. Next.js receives Firebase ID token
+  8. Next.js creates session (httpOnly cookie)
+  9. Redirect to dashboard
+```
+
+#### Step 1.3: Session Storage
+```
+Firebase Authentication
+  ├── User UID (unique identifier)
+  ├── Email
+  ├── Display Name
+  ├── Photo URL
+  └── Custom Claims (role, permissions)
+
+Next.js Session
+  ├── Firebase ID Token (JWT)
+  ├── Refresh Token
+  └── Session expiry
+```
+
+### Phase 2: User Data Management
+
+#### Step 2.1: Firestore Schema
+```
+users/
+  {uid}/
+    - email: string
+    - displayName: string
+    - photoURL: string
+    - createdAt: timestamp
+    - lastLogin: timestamp
+    - transferCount: number
+
+transfers/
+  {transferId}/
+    - userId: string (reference to users)
+    - fileName: string
+    - fileSize: number
+    - status: "pending" | "transferring" | "completed" | "failed"
+    - direction: "send" | "receive"
+    - startTime: timestamp
+    - endTime: timestamp
+    - clientIP: string
+    - serverIP: string
+    - port: number
+    - error: string (if failed)
+
+sessions/
+  {sessionId}/
+    - userId: string
+    - cProcessPID: number
+    - socketInfo: object
+    - createdAt: timestamp
+    - status: "active" | "closed"
+```
+
+#### Step 2.2: Data Synchronization
+```
+1. User logs in → Create/update user document in Firestore
+2. User initiates transfer → Create transfer document
+3. C process updates → Next.js updates Firestore in real-time
+4. User views history → Query transfers collection
+```
+
+### Phase 3: File Transfer Initiation
+
+#### Step 3.1: File Selection (Frontend)
+```javascript
+// User Flow
+User Action → File Input/Drag-Drop
   ↓
-Frontend → Server: AUTH_REQUEST {username, password_hash}
+File Validation
+  - Check file size limits
+  - Check file type
+  - Check user permissions
   ↓
-Server → Database: Validate credentials
+Display Preview
+  - File name
+  - File size
+  - Transfer mode (send/receive)
   ↓
-Server → Server: Generate JWT token
-  ↓
-Server → Client: AUTH_RESPONSE {token, user_id, status}
-  ↓
-Client: Store token, establish authenticated session
+User Confirms
 ```
 
-### 2.3 File Upload Flow
+#### Step 3.2: Transfer Request (API Route)
+```javascript
+// Next.js API Route: /api/transfer/send
+POST /api/transfer/send
+Headers: {
+  Authorization: Bearer {firebaseToken}
+}
+Body: {
+  fileName: "document.txt",
+  fileSize: 2048,
+  mode: "send",
+  targetIP: "127.0.0.1",
+  targetPort: 8080
+}
 
-```
-1. User selects file(s) via drag-drop or file picker
-2. Frontend chunks large files (64KB blocks)
-3. Client → Server: UPLOAD_INIT {token, filename, filesize, destination}
-4. Server validates permissions and responds with session_id
-5. For each chunk:
-   - Client → Server: UPLOAD_CHUNK {session_id, chunk_number, data}
-   - Server → Client: CHUNK_ACK {status}
-6. Client → Server: UPLOAD_COMPLETE {session_id}
-7. Server reassembles file, saves metadata, updates database
-8. Server → Client: SUCCESS {file_id, path}
-```
-
-### 2.4 File Download Flow
-
-```
-1. User browses file tree and selects file
-2. Client → Server: DOWNLOAD_REQUEST {token, file_id}
-3. Server validates user permissions
-4. Server chunks file and streams to client
-5. Server → Client: DOWNLOAD_CHUNK {chunk_number, data} (multiple)
-6. Client reassembles chunks with progress updates
-7. Client initiates browser download
+Response: {
+  transferId: "uuid",
+  status: "initiated",
+  processId: 12345
+}
 ```
 
-### 2.5 Directory Operations
+### Phase 4: C Process Integration
 
-**Upload Directory:**
-- Recursively traverse local directory structure
-- Create remote directories maintaining hierarchy
-- Upload files with proper path relationships
+#### Step 4.1: Node.js to C Communication
 
-**Download Directory:**
-- Server creates temporary ZIP archive
-- Stream archive to client
-- Client extracts locally
+**Option A: Child Process (Recommended)**
+```javascript
+// Next.js API Route Handler
+import { spawn } from 'child_process';
+import path from 'path';
 
-### 2.6 Permission Management
+export async function POST(request) {
+  // 1. Verify Firebase token
+  const user = await verifyToken(request);
 
-- Each file/folder has: owner, group, permission bits (rwx)
-- Owner can modify permissions through GUI
-- Server validates all operations against permissions
-- Permission changes are logged for audit
+  // 2. Parse request
+  const { fileName, mode, targetIP, targetPort } = await request.json();
 
----
+  // 3. Create Firestore transfer record
+  const transferDoc = await createTransferRecord(user.uid, fileName);
+
+  // 4. Spawn C process
+  const cClient = spawn('./client', [], {
+    cwd: path.join(process.cwd(), 'c-programs'),
+    env: {
+      ...process.env,
+      FILE_NAME: fileName,
+      TARGET_IP: targetIP,
+      TARGET_PORT: targetPort
+    }
+  });
+
+  // 5. Handle C process output
+  cClient.stdout.on('data', (data) => {
+    console.log(`C Client: ${data}`);
+    updateTransferProgress(transferDoc.id, data.toString());
+  });
+
+  cClient.stderr.on('data', (data) => {
+    console.error(`C Client Error: ${data}`);
+    updateTransferError(transferDoc.id, data.toString());
+  });
+
+  cClient.on('close', (code) => {
+    if (code === 0) {
+      markTransferComplete(transferDoc.id);
+    } else {
+      markTransferFailed(transferDoc.id, `Exit code: ${code}`);
+    }
+  });
+
+  return Response.json({ transferId: transferDoc.id, pid: cClient.pid });
+}
+```
+
+**Option B: Native Addon (Advanced)**
+```javascript
+// Using node-gyp to create N-API bindings
+const fileTransfer = require('./build/Release/filetransfer.node');
+
+export async function POST(request) {
+  const result = await fileTransfer.sendFile({
+    fileName: 'send.txt',
+    targetIP: '127.0.0.1',
+    targetPort: 8080
+  });
+  return Response.json(result);
+}
+```
+
+#### Step 4.2: Modified C Code Architecture
+
+**Updated client.c with environment variables:**
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+
+#define SIZE 1024
+
+// Read configuration from environment or arguments
+void read_config(char **filename, char **ip, int *port) {
+    char *env_file = getenv("FILE_NAME");
+    char *env_ip = getenv("TARGET_IP");
+    char *env_port = getenv("TARGET_PORT");
+
+    *filename = env_file ? env_file : "send.txt";
+    *ip = env_ip ? env_ip : "127.0.0.1";
+    *port = env_port ? atoi(env_port) : 8080;
+}
+
+// Send progress updates to stdout (Node.js reads this)
+void report_progress(const char *status, int bytes_sent) {
+    printf("PROGRESS:%s:%d\n", status, bytes_sent);
+    fflush(stdout);
+}
+
+int main(int argc, char *argv[]) {
+    char *filename, *ip;
+    int port;
+
+    read_config(&filename, &ip, &port);
+
+    // Report start
+    report_progress("STARTED", 0);
+
+    // ... existing socket and file transfer code ...
+
+    // Report progress during transfer
+    while(fgets(data, SIZE, fp) != NULL) {
+        int len = strlen(data);
+        if (send(sockfd, data, len, 0) == -1) {
+            report_progress("ERROR", total_sent);
+            exit(1);
+        }
+        total_sent += len;
+        report_progress("SENDING", total_sent);
+        bzero(data, SIZE);
+    }
+
+    report_progress("COMPLETED", total_sent);
+    return 0;
+}
+```
+
+### Phase 5: Real-time Progress Updates
+
+#### Step 5.1: WebSocket Connection
+```javascript
+// Frontend: app/transfer/page.tsx
+'use client';
+import { useEffect, useState } from 'react';
+import { db } from '@/lib/firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
+
+export default function TransferPage({ transferId }) {
+  const [progress, setProgress] = useState(null);
+
+  useEffect(() => {
+    // Real-time listener on Firestore
+    const unsubscribe = onSnapshot(
+      doc(db, 'transfers', transferId),
+      (doc) => {
+        setProgress(doc.data());
+      }
+    );
+
+    return () => unsubscribe();
+  }, [transferId]);
+
+  return (
+    <div>
+      <h2>Transfer Progress</h2>
+      <p>Status: {progress?.status}</p>
+      <p>Bytes Sent: {progress?.bytesSent}</p>
+      <ProgressBar value={progress?.percentage} />
+    </div>
+  );
+}
+```
+
+### Phase 6: Complete User Journey
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. USER AUTHENTICATION                                           │
+└─────────────────────────────────────────────────────────────────┘
+    User opens app
+      ↓
+    Next.js checks session
+      ↓
+    No session → Redirect to /login
+      ↓
+    Click "Sign in with Google"
+      ↓
+    Google OAuth flow
+      ↓
+    Firebase creates user session
+      ↓
+    Next.js sets httpOnly cookie
+      ↓
+    Redirect to /dashboard
+
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. DASHBOARD & FILE SELECTION                                    │
+└─────────────────────────────────────────────────────────────────┘
+    User sees dashboard
+      ↓
+    Firestore loads:
+      - User profile
+      - Transfer history
+      - Active connections
+      ↓
+    User clicks "Send File"
+      ↓
+    File picker opens
+      ↓
+    User selects file
+      ↓
+    Frontend validates:
+      - File size < 100MB
+      - File type allowed
+      ↓
+    User enters:
+      - Target IP (or selects peer)
+      - Target Port (default 8080)
+      ↓
+    User clicks "Start Transfer"
+
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. TRANSFER INITIATION                                           │
+└─────────────────────────────────────────────────────────────────┘
+    Frontend sends POST /api/transfer/send
+      ↓
+    Next.js API Route:
+      1. Verify Firebase token
+      2. Check user permissions
+      3. Create Firestore transfer doc
+      4. Save file to temp directory
+      5. Spawn C client process
+      6. Return transferId to frontend
+      ↓
+    Frontend navigates to /transfer/[id]
+
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. FILE TRANSFER EXECUTION                                       │
+└─────────────────────────────────────────────────────────────────┘
+    C Client Process:
+      1. Read environment config
+      2. Create socket
+      3. Connect to target
+      4. Send progress to stdout
+      ↓
+    Node.js reads C stdout:
+      - "PROGRESS:SENDING:1024"
+      - "PROGRESS:SENDING:2048"
+      ↓
+    Node.js updates Firestore:
+      transfers/{id} → { bytesSent: 2048, status: "transferring" }
+      ↓
+    Frontend Firestore listener:
+      - Receives real-time updates
+      - Updates progress bar
+      - Shows transfer speed
+      ↓
+    C Process completes:
+      - stdout: "PROGRESS:COMPLETED:5120"
+      - exit code 0
+      ↓
+    Node.js updates Firestore:
+      transfers/{id} → { status: "completed", endTime: now() }
+
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. POST-TRANSFER                                                 │
+└─────────────────────────────────────────────────────────────────┘
+    Frontend shows completion message
+      ↓
+    User clicks "View History"
+      ↓
+    Firestore query:
+      transfers.where('userId', '==', uid)
+               .orderBy('startTime', 'desc')
+      ↓
+    Display transfer list:
+      - File names
+      - Transfer times
+      - Success/failure status
+      - Download logs
+```
+
+## Security Considerations
+
+### Authentication Security
+```
+1. Firebase Token Validation
+   - Verify token on every API request
+   - Check token expiration
+   - Validate custom claims
+
+2. Session Management
+   - HttpOnly cookies (prevent XSS)
+   - Secure flag (HTTPS only)
+   - SameSite=Strict (prevent CSRF)
+   - Short expiration (1 hour)
+   - Refresh token rotation
+
+3. API Route Protection
+   middleware.ts:
+   - Check authentication
+   - Rate limiting
+   - CORS configuration
+```
+
+### File Transfer Security
+```
+1. Input Validation
+   - Sanitize file names
+   - Check file size limits
+   - Validate IP addresses
+   - Whitelist allowed ports
+
+2. File Storage
+   - Temporary file directory with restricted permissions
+   - Auto-cleanup after transfer
+   - Virus scanning (optional)
+
+3. Process Isolation
+   - C process runs with limited permissions
+   - Timeout limits (kill hung processes)
+   - Resource limits (CPU, memory)
+
+4. Network Security
+   - Option to use TLS/SSL wrapper
+   - IP whitelist/blacklist
+   - Port restrictions
+```
+
+## Database Schema Details
+
+### Firestore Collections
+
+```javascript
+// users collection
+{
+  uid: "firebase-user-id",
+  email: "user@example.com",
+  displayName: "John Doe",
+  photoURL: "https://...",
+  createdAt: Timestamp,
+  lastLogin: Timestamp,
+  settings: {
+    defaultPort: 8080,
+    autoAccept: false,
+    notifyOnTransfer: true
+  },
+  stats: {
+    totalTransfers: 42,
+    totalBytesSent: 1048576,
+    totalBytesReceived: 2097152
+  }
+}
+
+// transfers collection
+{
+  id: "transfer-uuid",
+  userId: "firebase-user-id",
+  fileName: "document.txt",
+  fileSize: 5120,
+  filePath: "/tmp/uploads/document.txt",
+  direction: "send", // or "receive"
+  peer: {
+    ip: "127.0.0.1",
+    port: 8080
+  },
+  status: "completed", // pending, transferring, completed, failed
+  progress: {
+    bytesSent: 5120,
+    bytesReceived: 5120,
+    percentage: 100,
+    speed: 1024 // bytes per second
+  },
+  timestamps: {
+    created: Timestamp,
+    started: Timestamp,
+    completed: Timestamp
+  },
+  process: {
+    pid: 12345,
+    exitCode: 0
+  },
+  error: null // or error message
+}
+
+// logs collection (optional)
+{
+  id: "log-uuid",
+  transferId: "transfer-uuid",
+  timestamp: Timestamp,
+  level: "info", // info, warning, error
+  message: "Connection established",
+  source: "c-client" // or "next-api"
+}
+```
+
+## API Endpoints
+
+### Authentication Endpoints
+```
+POST /api/auth/login
+  - Initiates Google OAuth flow
+
+POST /api/auth/callback
+  - Handles OAuth callback
+
+POST /api/auth/logout
+  - Clears session
+
+GET /api/auth/session
+  - Returns current user session
+```
+
+### Transfer Endpoints
+```
+POST /api/transfer/send
+  Body: { fileName, fileSize, targetIP, targetPort }
+  Response: { transferId, processId }
+
+POST /api/transfer/receive
+  Body: { port }
+  Response: { transferId, processId }
+
+GET /api/transfer/[id]
+  Response: { transfer details }
+
+DELETE /api/transfer/[id]
+  - Cancel active transfer
+
+GET /api/transfer/history
+  Query: { limit, offset }
+  Response: { transfers[] }
+```
+
+### User Endpoints
+```
+GET /api/user/profile
+  Response: { user data }
+
+PATCH /api/user/profile
+  Body: { settings }
+
+GET /api/user/stats
+  Response: { transfer statistics }
+```
+
+## Frontend Pages Structure
+
+```
+app/
+├── (auth)/
+│   ├── login/
+│   │   └── page.tsx          # Google OAuth login page
+│   └── callback/
+│       └── page.tsx          # OAuth callback handler
+│
+├── (dashboard)/
+│   ├── layout.tsx            # Protected layout (requires auth)
+│   ├── page.tsx              # Dashboard home
+│   ├── transfer/
+│   │   ├── send/
+│   │   │   └── page.tsx      # Send file interface
+│   │   ├── receive/
+│   │   │   └── page.tsx      # Receive file interface
+│   │   └── [id]/
+│   │       └── page.tsx      # Transfer progress page
+│   ├── history/
+│   │   └── page.tsx          # Transfer history
+│   └── profile/
+│       └── page.tsx          # User profile settings
+│
+└── api/
+    ├── auth/
+    │   ├── login/route.ts
+    │   ├── callback/route.ts
+    │   └── logout/route.ts
+    ├── transfer/
+    │   ├── send/route.ts
+    │   ├── receive/route.ts
+    │   └── [id]/route.ts
+    └── user/
+        ├── profile/route.ts
+        └── stats/route.ts
+```
+
+## Environment Configuration
+
+### .env.local
+```bash
+# Firebase Configuration
+NEXT_PUBLIC_FIREBASE_API_KEY=your-api-key
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=your-project.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=your-project-id
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=your-project.appspot.com
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=123456789
+NEXT_PUBLIC_FIREBASE_APP_ID=your-app-id
+
+# Firebase Admin (Server-side only)
+FIREBASE_ADMIN_PROJECT_ID=your-project-id
+FIREBASE_ADMIN_CLIENT_EMAIL=firebase-adminsdk@your-project.iam.gserviceaccount.com
+FIREBASE_ADMIN_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n..."
+
+# Google OAuth
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-client-secret
+
+# Application
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+C_PROGRAMS_PATH=/path/to/c-programs
+
+# File Transfer Settings
+MAX_FILE_SIZE=104857600  # 100MB
+TEMP_UPLOAD_DIR=/tmp/file-transfers
+DEFAULT_TRANSFER_PORT=8080
+```
+
+## Deployment Considerations
+
+### Development Setup
+```bash
+# 1. Compile C programs
+cd c-programs
+gcc -o client client.c
+gcc -o server server.c
+
+# 2. Install Node.js dependencies
+npm install
+
+# 3. Configure Firebase
+# - Create Firebase project
+# - Enable Google OAuth
+# - Download service account key
+
+# 4. Run development server
+npm run dev
+```
+
+### Production Deployment
+
+**Option 1: Vercel + Separate C Server**
+```
+Next.js → Vercel (serverless)
+C Programs → Separate VPS/EC2 instance
+Communication → HTTP API between Next.js and C server
+```
+
+**Option 2: VPS/EC2 (Recommended)**
+```
+Single server running:
+  - Next.js (Node.js process)
+  - C programs (spawned processes)
+  - Nginx (reverse proxy)
+```
+
+**Option 3: Docker Containers**
+```yaml
+# docker-compose.yml
+services:
+  nextjs:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - FIREBASE_CONFIG=${FIREBASE_CONFIG}
+    volumes:
+      - ./c-programs:/app/c-programs
+
+  c-server:
+    build: ./c-programs
+    network_mode: "host"
+```
+
+## Error Handling & Edge Cases
+
+### Scenarios to Handle
+```
+1. User loses internet during transfer
+   → Implement retry logic
+   → Save partial transfer state
+
+2. C process crashes
+   → Catch exit codes
+   → Log error to Firestore
+   → Notify user
+
+3. Target server unavailable
+   → Connection timeout
+   → Display user-friendly error
+
+4. File size exceeds limit
+   → Validate before upload
+   → Show error message
+
+5. Firebase quota exceeded
+   → Implement caching
+   → Rate limiting
+
+6. Concurrent transfers
+   → Queue system
+   → Limit simultaneous transfers
+```
+
+## Performance Optimization
+
+### Frontend
+- Code splitting (dynamic imports)
+- Image optimization (Next.js Image)
+- Lazy loading components
+- Memoization for expensive renders
+
+### Backend
+- Connection pooling
+- Caching with Redis (optional)
+- Batch Firestore writes
+- Stream large files (avoid loading in memory)
+
+### C Programs
+- Non-blocking I/O (epoll/select)
+- Buffer optimization
+- Memory management
+
+## Future Enhancements
+
+### Phase 2 Features
+- End-to-end encryption
+- Peer-to-peer discovery
+- Resume interrupted transfers
+- Multi-file transfers
+- Compression
+- Transfer scheduling
+
+### Phase 3 Features
+- Mobile apps (React Native)
+- WebRTC data channels (browser-to-browser)
+- CDN integration for large files
+- Admin dashboard
+- Analytics and monitoring
+
+## Success Metrics
+
+### Technical Metrics
+- Transfer success rate > 99%
+- Average transfer speed > 1 MB/s
+- API response time < 200ms
+- Page load time < 2s
+- C process spawn time < 100ms
+
+### User Metrics
+- Authentication success rate > 95%
+- User retention (weekly active users)
+- Average transfers per user
+- Error rate < 1%
+
+## Conclusion
+
+This architecture combines modern web technologies (Next.js, Firebase) with existing C file transfer code, providing:
+
+- **Scalable** web interface with real-time updates
+- **Secure** authentication via Google OAuth
+- **Reliable** file transfers using proven TCP code
+- **Observable** system with comprehensive logging
+- **Extensible** design for future enhancements
+
+The key integration point is the Next.js API routes spawning C processes and capturing their output for real-time progress updates stored in Firestore.
+
 
 ## 3. System Analysis and Design (UML Diagrams)
 
